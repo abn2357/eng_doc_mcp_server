@@ -1,8 +1,11 @@
+"""MCP 服务器主模块 - 提供 TRON 文档查询和链上数据查询服务"""
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import json
 import os
 import httpx
+
+# 导入文档搜索模块
+from doc_search import search_docs_three_tier
 
 app = FastAPI()
 
@@ -13,10 +16,9 @@ SERVER_INFO = {
 }
 
 # TRON RPC 配置
-# 可以使用公共节点或私有节点
 TRON_RPC_URL = os.getenv("TRON_RPC_URL", "https://api.trongrid.io")
 
-# 将工具定义提取出来，以便在 tools/list 中复用
+# 工具定义
 TOOLS_DEFINITION = [
     {
         "name": "SearchJavaTron",
@@ -24,7 +26,8 @@ TOOLS_DEFINITION = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "A query to search the content with."}
+                "query": {"type": "string", "description": "A query to search the content with."},
+                "limit": {"type": "integer", "description": "Number of results to return (1-10)", "default": 5}
             },
             "required": ["query"]
         }
@@ -35,7 +38,8 @@ TOOLS_DEFINITION = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "A query to search the content with."}
+                "query": {"type": "string", "description": "A query to search the content with."},
+                "limit": {"type": "integer", "description": "Number of results to return (1-10)", "default": 5}
             },
             "required": ["query"]
         }
@@ -118,11 +122,6 @@ TOOLS_DEFINITION = [
     }
 ]
 
-INDEX_PATH = "./site/search/search_index.json"
-BASE_URL = "https://tronprotocol.github.io/documentation-en/"
-
-DEVELOP_INDEX_PATH = "./site/search/develop_search_index.json"
-DEVELOP_BASE_URL = "https://developers.tron.network/"
 
 @app.get("/mcp")
 async def get_mcp_config():
@@ -150,7 +149,7 @@ async def handle_mcp_request(request: Request):
                     "protocolVersion": "2024-11-05",
                     "serverInfo": SERVER_INFO,
                     "capabilities": {
-                        "tools": {}  # 声明支持工具能力
+                        "tools": {}
                     }
                 }
             }
@@ -175,10 +174,44 @@ async def handle_mcp_request(request: Request):
             
             if tool_name == "SearchJavaTron":
                 query = arguments.get("query", "")
-                result_text = perform_search(query, INDEX_PATH, BASE_URL)
+                # 验证 query 参数
+                if not isinstance(query, str):
+                    result_text = "Error: query must be a string"
+                else:
+                    query = query.strip()
+                    # 验证 limit 参数
+                    try:
+                        limit = int(arguments.get("limit", 5))
+                        if limit < 1 or limit > 10:
+                            result_text = "Error: limit must be between 1 and 10"
+                        else:
+                            result_text = await search_docs_three_tier(
+                                source_name="java_tron",
+                                query=query,
+                                limit=limit
+                            )
+                    except (TypeError, ValueError):
+                        result_text = "Error: limit must be an integer"
             elif tool_name == "SearchDevelopJavaTron":
                 query = arguments.get("query", "")
-                result_text = perform_search(query, DEVELOP_INDEX_PATH, DEVELOP_BASE_URL)
+                # 验证 query 参数
+                if not isinstance(query, str):
+                    result_text = "Error: query must be a string"
+                else:
+                    query = query.strip()
+                    # 验证 limit 参数
+                    try:
+                        limit = int(arguments.get("limit", 5))
+                        if limit < 1 or limit > 10:
+                            result_text = "Error: limit must be between 1 and 10"
+                        else:
+                            result_text = await search_docs_three_tier(
+                                source_name="tron_developers",
+                                query=query,
+                                limit=limit
+                            )
+                    except (TypeError, ValueError):
+                        result_text = "Error: limit must be an integer"
             elif tool_name == "GetBlock":
                 result_text = await get_block(
                     arguments.get("block_number"),
@@ -214,31 +247,7 @@ async def handle_mcp_request(request: Request):
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 
-def perform_search(query: str, index_path: str, base_url: str):
-    """搜索本地文档"""
-    if not os.path.exists(index_path):
-        return "Error: Index not found. Run 'mkdocs build'."
-    with open(INDEX_PATH, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    # 按空格分词，每个词都要在 title 或 text 里出现（放宽匹配）
-    query_words = [w.strip() for w in query.lower().split() if len(w.strip()) > 1]
-    if not query_words:
-        query_words = [query.lower()]
-
-    hits = []
-    for doc in data['docs']:
-        title_lower = doc['title'].lower()
-        text_lower = doc.get('text', '').lower()
-        # 所有词都在该 doc 中出现即算命中
-        if all(word in title_lower or word in text_lower for word in query_words):
-            excerpt = (doc.get('text') or '')[:200]
-            hits.append(f"### {doc['title']}\nURL: {base_url}{doc['location']}\nExcerpt: {excerpt}...")
-            if len(hits) >= 5:
-                break
-
-    return "\n\n".join(hits) if hits else "No relevant documentation found."
-
+# ==================== TRON RPC 函数 ====================
 
 async def tron_rpc_request(endpoint: str, payload: dict = None, method: str = "POST") -> dict:
     """发送 TRON RPC 请求"""
@@ -268,10 +277,8 @@ async def tron_rpc_request(endpoint: str, payload: dict = None, method: str = "P
 async def get_block(block_number: int = None, block_hash: str = None, detail: bool = False):
     """查询区块信息"""
     if block_hash:
-        # 使用 block hash 查询
         result = await tron_rpc_request("/wallet/getblock", {"id_or_num": block_hash, "detail": detail})
     elif block_number is not None:
-        # 使用 block number 查询
         result = await tron_rpc_request("/wallet/getblockbynum", {"num": block_number})
     else:
         return "Error: Either block_number or block_hash must be provided."
@@ -282,7 +289,6 @@ async def get_block(block_number: int = None, block_hash: str = None, detail: bo
     if not result or (isinstance(result, dict) and not result.get("block_header")):
         return "Block not found."
     
-    # 格式化输出
     header = result.get("block_header", {}).get("raw_data", {})
     block_id = result.get("blockID", "N/A")
     
@@ -296,11 +302,10 @@ async def get_block(block_number: int = None, block_hash: str = None, detail: bo
 **Transaction Count:** {len(result.get("transactions", []))}
 """
     
-    # 添加交易信息
     transactions = result.get("transactions", [])
     if transactions:
         formatted += "\n**Transactions:**\n"
-        for i, tx in enumerate(transactions[:10]):  # 最多显示10个交易
+        for i, tx in enumerate(transactions[:10]):
             tx_id = tx.get("txID", "N/A")
             formatted += f"  {i+1}. `{tx_id}`\n"
         if len(transactions) > 10:
@@ -314,7 +319,6 @@ async def get_transaction(tx_hash: str):
     if not tx_hash:
         return "Error: Transaction hash is required."
     
-    # 获取交易基本信息
     result = await tron_rpc_request("/wallet/gettransactionbyid", {"value": tx_hash})
     
     if "error" in result:
@@ -323,14 +327,12 @@ async def get_transaction(tx_hash: str):
     if not result or (isinstance(result, dict) and not result.get("raw_data")):
         return "Transaction not found."
     
-    # 获取交易收据（包含费用等信息）
     receipt = await tron_rpc_request("/wallet/gettransactioninfobyid", {"value": tx_hash})
     
     raw_data = result.get("raw_data", {})
     contract = raw_data.get("contract", [{}])[0] if raw_data.get("contract") else {}
     parameter = contract.get("parameter", {}).get("value", {})
     
-    # 格式化输出
     formatted = f"""### Transaction Information
 
 **Transaction Hash:** `{tx_hash}`
@@ -340,7 +342,6 @@ async def get_transaction(tx_hash: str):
 **Expiration:** {raw_data.get("expiration", "N/A")} ({format_timestamp(raw_data.get("expiration"))})
 """
     
-    # 添加合约特定信息
     if "owner_address" in parameter:
         formatted += f"**From:** `{parameter.get('owner_address')}`\n"
     if "to_address" in parameter:
@@ -348,7 +349,6 @@ async def get_transaction(tx_hash: str):
     if "amount" in parameter:
         formatted += f"**Amount:** {parameter.get('amount', 0) / 1_000_000:.6f} TRX\n"
     
-    # 添加收据信息
     if receipt and isinstance(receipt, dict):
         if "fee" in receipt:
             formatted += f"**Fee:** {receipt.get('fee', 0) / 1_000_000:.6f} TRX\n"
@@ -377,7 +377,6 @@ async def get_account(address: str):
     if not result:
         return f"Account `{address}` not found or is inactive.\n\nNote: On TRON, accounts need to be activated by receiving at least 0.1 TRX or any TRC-10 token before they can be queried."
     
-    # 格式化输出
     balance_sun = result.get("balance", 0)
     balance_trx = balance_sun / 1_000_000
     
@@ -390,7 +389,6 @@ async def get_account(address: str):
 **Latest Operation Time:** {format_timestamp(result.get("latest_opration_time"))}
 """
     
-    # 添加 TRC-10 代币
     asset_issued = result.get("asset_issued_name")
     if asset_issued:
         formatted += f"\n**Issued Asset:** {bytes.fromhex(asset_issued).decode('utf-8', errors='ignore')}\n"
@@ -403,7 +401,6 @@ async def get_account(address: str):
             value = asset.get("value", 0)
             formatted += f"  - `{key}`: {value}\n"
     
-    # 添加冻结资源信息
     frozenV2 = result.get("frozenV2", [])
     if frozenV2:
         formatted += "\n**Frozen Resources (Stake 2.0):**\n"
@@ -412,7 +409,6 @@ async def get_account(address: str):
             amount = frozen.get("amount", 0)
             formatted += f"  - {resource_type}: {amount / 1_000_000:.6f} TRX\n"
     
-    # 添加投票信息
     votes = result.get("votes", [])
     if votes:
         formatted += "\n**Votes:**\n"
@@ -421,7 +417,6 @@ async def get_account(address: str):
             vote_count = vote.get("vote_count", 0)
             formatted += f"  - `{vote_address}`: {vote_count} votes\n"
     
-    # 添加权限信息
     owner_permission = result.get("owner_permission", {})
     if owner_permission:
         formatted += f"\n**Owner Permission Threshold:** {owner_permission.get('threshold', 0)}\n"
@@ -439,7 +434,6 @@ async def get_account_resource(address: str):
     if "error" in result:
         return f"Error querying account resource: {result['error']}"
     
-    # 格式化输出
     formatted = f"""### Account Resource Information
 
 **Address:** `{address}`
@@ -458,7 +452,6 @@ async def get_account_resource(address: str):
 - **Total Energy Weight:** {result.get("TotalEnergyWeight", 0)}
 """
     
-    # 添加 Stake 2.0 资源信息
     if "tronPowerLimit" in result:
         formatted += f"\n#### Tron Power\n- **Tron Power Limit:** {result.get('tronPowerLimit', 0)}\n"
     
